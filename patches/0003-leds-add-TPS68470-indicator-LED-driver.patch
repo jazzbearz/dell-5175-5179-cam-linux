@@ -1,0 +1,91 @@
+--- /dev/null
++++ b/drivers/leds/leds-tps68470.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TPS68470 indicator LED (ILED A/B) driver.
++ *
++ * The TPS68470 camera PMIC has two indicator current sinks controlled by
++ * ILEDCTL (0x28). Windows' Intel control-logic driver uses them for the
++ * camera privacy LED (ENA = bit 2, ENB = bit 6). Current-select bits are
++ * left at their reset value (lowest setting).
++ */
++
++#include <linux/bits.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#define TPS68470_REG_ILEDCTL	0x28
++#define TPS68470_ILEDCTL_ENA	BIT(2)
++#define TPS68470_ILEDCTL_ENB	BIT(6)
++
++struct tps68470_iled {
++	struct led_classdev cdev;
++	struct regmap *regmap;
++	unsigned int en_mask;
++};
++
++static int tps68470_iled_set(struct led_classdev *cdev,
++			     enum led_brightness brightness)
++{
++	struct tps68470_iled *led = container_of(cdev, struct tps68470_iled, cdev);
++
++	return regmap_update_bits(led->regmap, TPS68470_REG_ILEDCTL,
++				  led->en_mask, brightness ? led->en_mask : 0);
++}
++
++static int tps68470_led_probe(struct platform_device *pdev)
++{
++	static const struct {
++		const char *name;
++		unsigned int mask;
++	} outputs[] = {
++		{ "tps68470::ileda", TPS68470_ILEDCTL_ENA },
++		{ "tps68470::iledb", TPS68470_ILEDCTL_ENB },
++	};
++	struct regmap *regmap = dev_get_drvdata(pdev->dev.parent);
++	struct tps68470_iled *leds;
++	int i, ret;
++
++	if (!regmap)
++		return -EPROBE_DEFER;
++
++	leds = devm_kcalloc(&pdev->dev, ARRAY_SIZE(outputs), sizeof(*leds), GFP_KERNEL);
++	if (!leds)
++		return -ENOMEM;
++
++	/* Start with both indicators off */
++	ret = regmap_update_bits(regmap, TPS68470_REG_ILEDCTL,
++				 TPS68470_ILEDCTL_ENA | TPS68470_ILEDCTL_ENB, 0);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < ARRAY_SIZE(outputs); i++) {
++		leds[i].regmap = regmap;
++		leds[i].en_mask = outputs[i].mask;
++		leds[i].cdev.name = outputs[i].name;
++		leds[i].cdev.max_brightness = 1;
++		leds[i].cdev.brightness_set_blocking = tps68470_iled_set;
++
++		ret = devm_led_classdev_register(&pdev->dev, &leds[i].cdev);
++		if (ret)
++			return dev_err_probe(&pdev->dev, ret, "registering %s\n",
++					     outputs[i].name);
++	}
++
++	return 0;
++}
++
++static struct platform_driver tps68470_led_driver = {
++	.driver = {
++		.name = "tps68470-led",
++	},
++	.probe = tps68470_led_probe,
++};
++module_platform_driver(tps68470_led_driver);
++
++MODULE_ALIAS("platform:tps68470-led");
++MODULE_DESCRIPTION("TPS68470 indicator LED driver");
++MODULE_LICENSE("GPL");

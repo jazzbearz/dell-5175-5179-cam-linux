@@ -1,0 +1,107 @@
+--- a/drivers/platform/x86/intel/int3472/tps68470.c
++++ b/drivers/platform/x86/intel/int3472/tps68470.c
+@@ -4,7 +4,9 @@
+ #include <linux/acpi.h>
+ #include <linux/i2c.h>
+ #include <linux/kernel.h>
++#include <linux/leds.h>
+ #include <linux/mfd/core.h>
++#include <linux/moduleparam.h>
+ #include <linux/mfd/tps68470.h>
+ #include <linux/platform_device.h>
+ #include <linux/platform_data/tps68470.h>
+@@ -17,7 +19,57 @@
+ #define DESIGNED_FOR_CHROMEOS		1
+ #define DESIGNED_FOR_WINDOWS		2
+ 
+-#define TPS68470_WIN_MFD_CELL_COUNT	3
++#define TPS68470_WIN_MFD_CELL_COUNT	4
++
++static char *privacy_led = "";
++module_param(privacy_led, charp, 0444);
++MODULE_PARM_DESC(privacy_led,
++		 "Indicator output used as the camera privacy LED: \"a\", \"b\" or empty (none)");
++
++static struct led_lookup_data *tps68470_led_lookups;
++static unsigned int tps68470_n_led_lookups;
++
++/*
++ * Link the chosen ILED output to every sensor this PMIC serves, so the V4L2
++ * core turns it on while streaming. Must run before the sensors probe.
++ */
++static void skl_int3472_tps68470_add_led_lookups(struct device *dev,
++		const struct int3472_tps68470_board_data *board_data)
++{
++	const char *provider;
++	unsigned int i;
++
++	if (!strcmp(privacy_led, "a"))
++		provider = "tps68470::ileda";
++	else if (!strcmp(privacy_led, "b"))
++		provider = "tps68470::iledb";
++	else
++		return;
++
++	tps68470_led_lookups = devm_kcalloc(dev, board_data->n_gpiod_lookups,
++					    sizeof(*tps68470_led_lookups), GFP_KERNEL);
++	if (!tps68470_led_lookups)
++		return;
++
++	for (i = 0; i < board_data->n_gpiod_lookups; i++) {
++		tps68470_led_lookups[i].provider = provider;
++		tps68470_led_lookups[i].dev_id = board_data->tps68470_gpio_lookup_tables[i]->dev_id;
++		/* v4l2_subdev_get_privacy_led() looks up con_id "privacy" */
++		tps68470_led_lookups[i].con_id = "privacy";
++		led_add_lookup(&tps68470_led_lookups[i]);
++	}
++	tps68470_n_led_lookups = board_data->n_gpiod_lookups;
++	dev_info(dev, "privacy LED: %s\n", provider);
++}
++
++static void skl_int3472_tps68470_remove_led_lookups(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < tps68470_n_led_lookups; i++)
++		led_remove_lookup(&tps68470_led_lookups[i]);
++	tps68470_n_led_lookups = 0;
++}
+ 
+ static const struct mfd_cell tps68470_cros[] = {
+ 	{ .name = "tps68470-gpio" },
+@@ -196,10 +248,12 @@
+ 		cells[1].name = "tps68470-regulator";
+ 		cells[1].platform_data = (void *)board_data->tps68470_regulator_pdata;
+ 		cells[1].pdata_size = sizeof(struct tps68470_regulator_platform_data);
+-		cells[2].name = "tps68470-gpio";
++		cells[2].name = "tps68470-led";
++		cells[3].name = "tps68470-gpio";
+ 
+ 		for (i = 0; i < board_data->n_gpiod_lookups; i++)
+ 			gpiod_add_lookup_table(board_data->tps68470_gpio_lookup_tables[i]);
++		skl_int3472_tps68470_add_led_lookups(&client->dev, board_data);
+ 
+ 		ret = devm_mfd_add_devices(&client->dev, PLATFORM_DEVID_NONE,
+ 					   cells, TPS68470_WIN_MFD_CELL_COUNT,
+@@ -209,6 +263,7 @@
+ 		if (ret) {
+ 			for (i = 0; i < board_data->n_gpiod_lookups; i++)
+ 				gpiod_remove_lookup_table(board_data->tps68470_gpio_lookup_tables[i]);
++			skl_int3472_tps68470_remove_led_lookups();
+ 		}
+ 
+ 		break;
+@@ -240,6 +295,7 @@
+ 		for (i = 0; i < board_data->n_gpiod_lookups; i++)
+ 			gpiod_remove_lookup_table(board_data->tps68470_gpio_lookup_tables[i]);
+ 	}
++	skl_int3472_tps68470_remove_led_lookups();
+ }
+ 
+ static const struct acpi_device_id int3472_device_id[] = {
+@@ -262,4 +318,4 @@
+ MODULE_AUTHOR("Daniel Scally <djrscally@gmail.com>");
+ MODULE_LICENSE("GPL v2");
+ MODULE_IMPORT_NS("INTEL_INT3472");
+-MODULE_SOFTDEP("pre: clk-tps68470 tps68470-regulator");
++MODULE_SOFTDEP("pre: clk-tps68470 tps68470-regulator leds-tps68470");
