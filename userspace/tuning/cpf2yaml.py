@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""
+Convert an Intel IQ Studio camera tuning file (.cpf / .aiqb, "CPFF"/"AIQB"
+container, AIQ v2.0) into a libcamera IPU3 tuning YAML containing:
+
+  - Ccm: colour correction matrices per colour temperature (CMC record 18)
+  - Lsc: lens-shading gain grids per colour temperature (CMC record 10)
+
+The layout was reverse-engineered from Dell's V9X4F package (OV5670/OV8858,
+Skylake). See PAPER.md. Only the records needed here are decoded.
+
+Usage: cpf2yaml.py INPUT.cpf OUTPUT.yaml [--sensor NAME]
+"""
+
+import argparse
+import struct
+import sys
+
+# Intel CMC light-source ids follow the CIE illuminant order.
+LIGHT_SOURCE_CCT = {
+    1: 2856,  # A
+    2: 4874,  # B
+    3: 6774,  # C
+    4: 5003,  # D50
+    5: 5503,  # D55
+    6: 6504,  # D65
+    7: 7504,  # D75
+    8: 5454,  # E
+    9: 6430,  # F1
+    10: 4230,  # F2 (CWF)
+    11: 3450,  # F3
+    12: 2940,  # F4
+    13: 6350,  # F5
+    14: 4150,  # F6
+    15: 6500,  # F7
+    16: 5000,  # F8
+    17: 4150,  # F9
+    18: 5000,  # F10
+    19: 4000,  # F11 (TL84)
+    20: 3000,  # F12
+}
+
+
+# AIQB index of the ImgU r, gr, gb, b channels for each raw Bayer order
+# (channels are stored as raster positions (0,0), (0,1), (1,0), (1,1)).
+BAYER_MAPS = {
+    'RGGB': (0, 1, 2, 3),
+    'GRBG': (1, 0, 3, 2),
+    'GBRG': (2, 3, 0, 1),
+    'BGGR': (3, 2, 1, 0),
+}
+
+
+def records(data):
+    if data[:4] == b'CPFF':
+        base = 0x20
+    elif data[:4] == b'AIQB':
+        base = 0
+    else:
+        raise ValueError('not a CPFF/AIQB file')
+    if data[base:base + 4] != b'AIQB':
+        raise ValueError('AIQB block not found')
+    end = base + struct.unpack_from('<I', data, base + 4)[0]
+    off = base + 0x18
+    recs = {}
+    while off + 8 <= end:
+        size, fmt, rid = struct.unpack_from('<IHH', data, off)
+        if size < 8 or off + size > end:
+            break
+        recs.setdefault(rid, (off + 8, size - 8, fmt))
+        off += size
+    return recs
+
+
+def s15_16(lo, hi):
+    v = (hi << 16) | lo
+    if v & 0x80000000:
+        v -= 1 << 32
+    return v / 65536.0
+
+
+def parse_sensor(data, recs):
+    off, _, _ = recs[2]
+    w, h, bits, order = struct.unpack_from('<4H', data, off)
+    return w, h, bits, order
+
+
+def parse_ccm(data, recs):
+    off, size, _ = recs[18]
+    n = struct.unpack_from('<H', data, off)[0]
+    entry = 84  # u16 src, 5 x u16, 2 x 9 x s32
+    out = []
+    for i in range(n):
+        e = off + 2 + i * entry
+        src = struct.unpack_from('<H', data, e)[0]
+        u = struct.unpack_from('<18H', data, e + 12)
+        m = [s15_16(u[2 * k], u[2 * k + 1]) for k in range(9)]
+        out.append((src, m))
+    return out
+
+
+def parse_lsc(data, recs):
+    off, size, _ = recs[10]
+    _, n, w, h = struct.unpack_from('<4H', data, off)
+    cells = w * h
+    per = 8 + cells * 8
+    out = []
+    for i in range(n):
+        t = off + 8 + i * per
+        src = struct.unpack_from('<H', data, t)[0]
+        chans = [list(struct.unpack_from(f'<{cells}H', data, t + 8 + c * cells * 2))
+                 for c in range(4)]
+        out.append((src, chans))
+    return (w, h), out
+
+
+def unique_by_cct(entries):
+    """Keep one entry per CCT, preferring daylight/incandescent sources."""
+    preferred = {1, 2, 3, 4, 5, 6, 7, 8}
+    best = {}
+    for src, payload in entries:
+        cct = LIGHT_SOURCE_CCT.get(src)
+        if cct is None:
+            continue
+        if cct not in best or (src in preferred and best[cct][0] not in preferred):
+            best[cct] = (src, payload)
+    return sorted(best.items())
+
+
+def fmt_list(values, per_line=16, indent=10, fmt='{}'):
+    pad = ' ' * indent
+    lines = []
+    for i in range(0, len(values), per_line):
+        lines.append(pad + ', '.join(fmt.format(v) for v in values[i:i + per_line]))
+    return '[\n' + ',\n'.join(lines) + '\n' + ' ' * (indent - 2) + ']'
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('input')
+    ap.add_argument('output')
+    ap.add_argument('--sensor', default='', help='comment only')
+    ap.add_argument('--bayer', required=True, choices=sorted(BAYER_MAPS),
+                    help='raw Bayer order of the sensor as seen by Linux '
+                         '(ImgU input format; e.g. OV5670 GRBG, OV8858 BGGR)')
+    ap.add_argument('--saturation', type=float, default=0.6,
+                    help='CCM strength, 0 = identity, 1 = tuned matrices (default 0.6)')
+    args = ap.parse_args()
+
+    data = open(args.input, 'rb').read()
+    recs = records(data)
+    sw, sh, bits, order = parse_sensor(data, recs)
+    ccms = unique_by_cct(parse_ccm(data, recs))
+    (gw, gh), lsc = parse_lsc(data, recs)
+    lsc = unique_by_cct(lsc)
+
+    o = []
+    o.append('# SPDX-License-Identifier: CC0-1.0')
+    o.append('%YAML 1.1')
+    o.append('---')
+    o.append(f'# Generated by cpf2yaml.py from {args.input.split("/")[-1]} {args.sensor}')
+    o.append(f'# AIQB sensor {sw}x{sh}, {bits} bit, colour order {order}')
+    o.append('version: 1')
+    o.append('algorithms:')
+    o.append('  - Af:')
+    o.append('  - Agc:')
+    o.append('  - Awb:')
+    o.append('  - BlackLevelCorrection:')
+    o.append('  - Ccm:')
+    o.append(f'      saturation: {args.saturation}')
+    o.append('      ccms:')
+    for cct, (src, m) in ccms:
+        o.append(f'        - ct: {cct}  # light source {src}')
+        o.append('          ccm: [ ' + ', '.join(f'{v:.5f}' for v in m) + ' ]')
+    o.append('  - Lsc:')
+    o.append(f'      sensorSize: [ {sw}, {sh} ]')
+    o.append(f'      grid: [ {gw}, {gh} ]')
+    # AIQB LSC channels are stored in the sensor's raw Bayer order (measured
+    # on IPU3); channelMap lists the AIQB index for ImgU r, gr, gb, b.
+    cmap = BAYER_MAPS[args.bayer]
+    o.append(f'      # raw order {args.bayer}')
+    o.append(f'      channelMap: [ {cmap[0]}, {cmap[1]}, {cmap[2]}, {cmap[3]} ]')
+    o.append('      sets:')
+    for cct, (src, chans) in lsc:
+        o.append(f'        - ct: {cct}  # light source {src}')
+        for c in range(4):
+            o.append(f'          c{c}: ' + fmt_list(chans[c], per_line=gw if gw <= 64 else 32, indent=12))
+    o.append('  - ToneMapping:')
+    o.append('...')
+
+    with open(args.output, 'w') as f:
+        f.write('\n'.join(o) + '\n')
+    print(f'{args.output}: {len(ccms)} CCMs, {len(lsc)} LSC sets ({gw}x{gh}), sensor {sw}x{sh}',
+          file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()

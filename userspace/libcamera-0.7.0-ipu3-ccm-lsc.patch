@@ -1,0 +1,516 @@
+diff -ruN a/src/ipa/ipu3/algorithms/ccm.cpp b/src/ipa/ipu3/algorithms/ccm.cpp
+--- a/src/ipa/ipu3/algorithms/ccm.cpp	1970-01-01 09:00:00.000000000 +0900
++++ b/src/ipa/ipu3/algorithms/ccm.cpp	2026-11-19 16:49:18.068349892 +0900
+@@ -0,0 +1,98 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * IPU3 Colour Correction Matrix from tuning data
++ */
++
++#include "ccm.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++/**
++ * \file ccm.h
++ */
++
++namespace libcamera {
++
++namespace ipa::ipu3::algorithms {
++
++/**
++ * \class Ccm
++ * \brief Program the ImgU colour correction matrix from per-colour-temperature
++ * tuning data, interpolated with the AWB colour temperature estimate
++ *
++ * The ImgU CCM uses s2.13 coefficients (8192 = 1.0) with a per-channel bias.
++ * This algorithm must be listed after Awb in the tuning file, as Awb writes a
++ * fixed default matrix.
++ */
++
++LOG_DEFINE_CATEGORY(IPU3Ccm)
++
++int Ccm::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	int ret = ccm_.readYaml(tuningData["ccms"], "ct", "ccm");
++	if (ret < 0) {
++		LOG(IPU3Ccm, Error) << "Failed to parse 'ccms' from tuning data";
++		return ret;
++	}
++
++	/*
++	 * Optional strength: 1.0 applies the tuned matrices as-is, 0.0 is the
++	 * identity. Blending keeps each row summing to 1 (white preserved).
++	 */
++	saturation_ = tuningData["saturation"].get<double>(1.0);
++
++	LOG(IPU3Ccm, Info) << "Loaded " << ccm_.data().size() << " CCMs, saturation "
++			   << saturation_;
++	return 0;
++}
++
++static int16_t ccmCoeff(float v)
++{
++	long c = std::lround(v * 8192.0f);
++	return static_cast<int16_t>(std::clamp<long>(c, -32768, 32767));
++}
++
++void Ccm::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		  [[maybe_unused]] IPAFrameContext &frameContext,
++		  ipu3_uapi_params *params)
++{
++	unsigned int ct = static_cast<unsigned int>(context.activeState.awb.temperatureK);
++	/* Quantize to limit recomputation. */
++	ct = (ct + 50) / 100 * 100;
++
++	const Matrix<float, 3, 3> &tuned = ccm_.getInterpolated(ct);
++	Matrix<float, 3, 3> m = Matrix<float, 3, 3>::identity() * (1.0 - saturation_) +
++				tuned * saturation_;
++	ipu3_uapi_ccm_mat_config &c = params->acc_param.ccm;
++
++	c.coeff_m11 = ccmCoeff(m[0][0]);
++	c.coeff_m12 = ccmCoeff(m[0][1]);
++	c.coeff_m13 = ccmCoeff(m[0][2]);
++	c.coeff_o_r = 0;
++	c.coeff_m21 = ccmCoeff(m[1][0]);
++	c.coeff_m22 = ccmCoeff(m[1][1]);
++	c.coeff_m23 = ccmCoeff(m[1][2]);
++	c.coeff_o_g = 0;
++	c.coeff_m31 = ccmCoeff(m[2][0]);
++	c.coeff_m32 = ccmCoeff(m[2][1]);
++	c.coeff_m33 = ccmCoeff(m[2][2]);
++	c.coeff_o_b = 0;
++
++	params->use.acc_ccm = 1;
++
++	if (ct != lastCt_) {
++		LOG(IPU3Ccm, Debug) << "CT " << ct << " CCM " << m;
++		lastCt_ = ct;
++	}
++}
++
++REGISTER_IPA_ALGORITHM(Ccm, "Ccm")
++
++} /* namespace ipa::ipu3::algorithms */
++
++} /* namespace libcamera */
+diff -ruN a/src/ipa/ipu3/algorithms/ccm.h b/src/ipa/ipu3/algorithms/ccm.h
+--- a/src/ipa/ipu3/algorithms/ccm.h	1970-01-01 09:00:00.000000000 +0900
++++ b/src/ipa/ipu3/algorithms/ccm.h	2026-11-19 16:49:18.068195137 +0900
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * IPU3 Colour Correction Matrix from tuning data
++ */
++
++#pragma once
++
++#include "libcamera/internal/matrix.h"
++
++#include "libipa/interpolator.h"
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::ipu3::algorithms {
++
++class Ccm : public Algorithm
++{
++public:
++	Ccm() = default;
++
++	int init(IPAContext &context, const YamlObject &tuningData) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     ipu3_uapi_params *params) override;
++
++private:
++	Interpolator<Matrix<float, 3, 3>> ccm_;
++	unsigned int lastCt_ = 0;
++	double saturation_ = 1.0;
++};
++
++} /* namespace ipa::ipu3::algorithms */
++
++} /* namespace libcamera */
+diff -ruN a/src/ipa/ipu3/algorithms/lsc.cpp b/src/ipa/ipu3/algorithms/lsc.cpp
+--- a/src/ipa/ipu3/algorithms/lsc.cpp	1970-01-01 09:00:00.000000000 +0900
++++ b/src/ipa/ipu3/algorithms/lsc.cpp	2026-11-19 16:49:18.068564501 +0900
+@@ -0,0 +1,291 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * IPU3 Lens Shading Correction from tuning data
++ */
++
++#include "lsc.h"
++
++#include <algorithm>
++#include <cmath>
++#include <string.h>
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++/**
++ * \file lsc.h
++ */
++
++namespace libcamera {
++
++namespace ipa::ipu3::algorithms {
++
++/**
++ * \class Lsc
++ * \brief Bayer lens-shading correction using per-colour-temperature gain grids
++ *
++ * Tuning data holds gain grids (4096 = 1.0) covering the full sensor
++ * (\a sensorSize) for four Bayer channels, per colour temperature. For each
++ * session the grids are mapped through the sensor analogue crop and scaling
++ * onto the raw frame, resampled to an ImgU shading grid and encoded as
++ * (gain - 1) * 1024 >> gain_factor (u12).
++ *
++ * Optional tuning keys for bring-up:
++ *  - testPattern: fixed LUT value on the left half of the frame, 0 elsewhere
++ *  - gainFactor: force the ImgU gain_factor (0, 1 or 2)
++ *  - channelMap: tuning channel index used for ImgU r, gr, gb, b
++ */
++
++LOG_DEFINE_CATEGORY(IPU3Lsc)
++
++static constexpr unsigned int kMaxCellsPerSet = IPU3_UAPI_SHD_MAX_CELLS_PER_SET;
++static constexpr unsigned int kMaxSets = IPU3_UAPI_SHD_MAX_CFG_SETS;
++
++int Lsc::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	auto size = tuningData["sensorSize"].getList<unsigned int>();
++	auto grid = tuningData["grid"].getList<unsigned int>();
++	if (!size || size->size() != 2 || !grid || grid->size() != 2) {
++		LOG(IPU3Lsc, Error) << "Missing sensorSize or grid";
++		return -EINVAL;
++	}
++	tuningSize_ = { (*size)[0], (*size)[1] };
++	tuningW_ = (*grid)[0];
++	tuningH_ = (*grid)[1];
++
++	auto map = tuningData["channelMap"].getList<unsigned int>();
++	if (map && map->size() == 4)
++		std::copy(map->begin(), map->end(), channelMap_.begin());
++
++	testValue_ = tuningData["testPattern"].get<int>(-1);
++	gainFactorOverride_ = tuningData["gainFactor"].get<int>(-1);
++	testChannel_ = tuningData["testChannel"].get<int>(-1);
++
++	const unsigned int cells = tuningW_ * tuningH_;
++	for (const auto &set : tuningData["sets"].asList()) {
++		unsigned int ct = set["ct"].get<unsigned int>(0);
++		Tables tables;
++		for (unsigned int c = 0; c < 4; c++) {
++			auto values = set["c" + std::to_string(c)].getList<uint16_t>();
++			if (!values || values->size() != cells) {
++				LOG(IPU3Lsc, Error) << "Bad table c" << c << " for ct " << ct;
++				return -EINVAL;
++			}
++			tables[c].resize(cells);
++			for (unsigned int i = 0; i < cells; i++)
++				tables[c][i] = (*values)[i] / 4096.0f;
++		}
++		sets_[ct] = std::move(tables);
++	}
++
++	if (sets_.empty() && testValue_ < 0) {
++		LOG(IPU3Lsc, Error) << "No LSC sets";
++		return -EINVAL;
++	}
++
++	lut_ = std::make_unique<ipu3_uapi_shd_lut>();
++
++	LOG(IPU3Lsc, Info) << "Loaded " << sets_.size() << " LSC sets "
++			   << tuningW_ << "x" << tuningH_;
++	return 0;
++}
++
++int Lsc::configure([[maybe_unused]] IPAContext &context,
++		   const IPAConfigInfo &configInfo)
++{
++	const IPACameraSensorInfo &info = configInfo.sensorInfo;
++	activeArea_ = info.activeAreaSize;
++	analogCrop_ = info.analogCrop;
++	outputSize_ = info.outputSize;
++	/*
++	 * The shading block runs after the Bayer down-scaler: the grid is in
++	 * BDS output coordinates. The BDS input is the IF crop, which libcamera
++	 * places at the top-left corner of the raw frame.
++	 */
++	ifSize_ = configInfo.iif;
++	bdsSize_ = configInfo.bdsOutputSize;
++	if (ifSize_.isNull() || bdsSize_.isNull()) {
++		LOG(IPU3Lsc, Error) << "Missing IF/BDS sizes";
++		return -EINVAL;
++	}
++
++	/* Pick the finest grid that fits the ImgU shading LUT limits. */
++	unsigned int bw = 3, w = 0;
++	for (; bw <= 7; bw++) {
++		w = (bdsSize_.width + (1u << bw) - 1) / (1u << bw) + 1;
++		if (w <= 73)
++			break;
++	}
++	unsigned int perSlice = kMaxCellsPerSet / w;
++	unsigned int bh = 3, h = 0;
++	for (; bh <= 7; bh++) {
++		h = (bdsSize_.height + (1u << bh) - 1) / (1u << bh) + 1;
++		if (h <= kMaxSets * perSlice && h <= 128)
++			break;
++	}
++	if (bw > 7 || bh > 7) {
++		LOG(IPU3Lsc, Error) << "Cannot fit shading grid for " << bdsSize_;
++		return -EINVAL;
++	}
++
++	grid_ = {};
++	grid_.width = w;
++	grid_.height = h;
++	grid_.block_width_log2 = bw;
++	grid_.block_height_log2 = bh;
++	grid_.grid_height_per_slice = perSlice;
++	grid_.x_start = 0;
++	grid_.y_start = 0;
++
++	lastCt_ = 0;
++	configured_ = true;
++
++	LOG(IPU3Lsc, Info) << "Output " << outputSize_ << " crop " << analogCrop_
++			   << " active " << activeArea_ << " IF " << ifSize_
++			   << " BDS " << bdsSize_ << " -> grid " << w << "x" << h
++			   << " cells " << (1u << bw) << "x" << (1u << bh);
++	return 0;
++}
++
++float Lsc::sample(const std::vector<float> &table, float u, float v) const
++{
++	u = std::clamp(u, 0.0f, static_cast<float>(tuningW_ - 1));
++	v = std::clamp(v, 0.0f, static_cast<float>(tuningH_ - 1));
++	unsigned int x0 = std::min(static_cast<unsigned int>(u), tuningW_ - 2);
++	unsigned int y0 = std::min(static_cast<unsigned int>(v), tuningH_ - 2);
++	float fx = u - x0, fy = v - y0;
++	const float *r0 = &table[y0 * tuningW_];
++	const float *r1 = &table[(y0 + 1) * tuningW_];
++	float top = r0[x0] * (1 - fx) + r0[x0 + 1] * fx;
++	float bot = r1[x0] * (1 - fx) + r1[x0 + 1] * fx;
++	return top * (1 - fy) + bot * fy;
++}
++
++void Lsc::computeLut(unsigned int ct)
++{
++	const unsigned int w = grid_.width, h = grid_.height;
++	const unsigned int perSlice = grid_.grid_height_per_slice;
++
++	/* Gains on the ImgU grid, per ImgU channel (r, gr, gb, b). */
++	std::array<std::vector<float>, 4> gains;
++	for (auto &g : gains)
++		g.assign(w * h, 1.0f);
++
++	float maxGain = 1.0f;
++
++	if (testValue_ < 0) {
++		/* Interpolate between the two nearest colour temperatures. */
++		auto hi = sets_.lower_bound(ct);
++		const Tables *a, *b;
++		float lambda = 0.0f;
++		if (hi == sets_.begin()) {
++			a = b = &hi->second;
++		} else if (hi == sets_.end()) {
++			a = b = &std::prev(hi)->second;
++		} else {
++			auto lo = std::prev(hi);
++			a = &lo->second;
++			b = &hi->second;
++			lambda = static_cast<float>(ct - lo->first) / (hi->first - lo->first);
++		}
++
++		/* Tuning grid is centred on the active area. */
++		float offX = (static_cast<float>(tuningSize_.width) - activeArea_.width) / 2;
++		float offY = (static_cast<float>(tuningSize_.height) - activeArea_.height) / 2;
++		/* BDS pixel -> raw pixel (IF at origin) -> sensor array. */
++		float bx = static_cast<float>(ifSize_.width) / bdsSize_.width;
++		float by = static_cast<float>(ifSize_.height) / bdsSize_.height;
++		float sx = static_cast<float>(analogCrop_.width) / outputSize_.width;
++		float sy = static_cast<float>(analogCrop_.height) / outputSize_.height;
++		float ku = (tuningW_ - 1) / static_cast<float>(tuningSize_.width);
++		float kv = (tuningH_ - 1) / static_cast<float>(tuningSize_.height);
++
++		for (unsigned int i = 0; i < h; i++) {
++			float py = std::min<float>(i << grid_.block_height_log2, bdsSize_.height - 1) * by;
++			float v = (analogCrop_.y + py * sy + offY) * kv;
++			for (unsigned int j = 0; j < w; j++) {
++				float px = std::min<float>(j << grid_.block_width_log2, bdsSize_.width - 1) * bx;
++				float u = (analogCrop_.x + px * sx + offX) * ku;
++				for (unsigned int c = 0; c < 4; c++) {
++					unsigned int src = channelMap_[c];
++					float g = sample(a->at(src), u, v) * (1 - lambda) +
++						  sample(b->at(src), u, v) * lambda;
++					gains[c][i * w + j] = g;
++					maxGain = std::max(maxGain, g);
++				}
++			}
++		}
++	}
++
++	if (gainFactorOverride_ >= 0)
++		gainFactor_ = gainFactorOverride_;
++	else
++		gainFactor_ = maxGain < 4.99f ? 0 : maxGain < 8.99f ? 1 : 2;
++
++	memset(lut_.get(), 0, sizeof(*lut_));
++	/*
++	 * Measured on IPU3: LUT entries are u12 and the applied gain is
++	 * 1 + v * 2^gain_factor / 1024, i.e. [1, 5), [1, 9) or [1, 17).
++	 */
++	const float scale = 1024.0f / (1u << gainFactor_);
++
++	auto encode = [&](unsigned int c, unsigned int i, unsigned int j) -> uint16_t {
++		if (testValue_ >= 0) {
++			if (testChannel_ >= 0)
++				return static_cast<int>(c) == testChannel_ ? testValue_ : 0;
++			return j < w / 2 ? testValue_ : 0;
++		}
++		float v = std::lround((gains[c][i * w + j] - 1.0f) * scale);
++		return static_cast<uint16_t>(std::clamp(v, 0.0f, 4095.0f));
++	};
++
++	for (unsigned int i = 0; i < h; i++) {
++		unsigned int set = i / perSlice;
++		unsigned int row = i % perSlice;
++		if (set >= kMaxSets)
++			break;
++		/* Packed struct: no references to members. */
++		for (unsigned int j = 0; j < w; j++) {
++			unsigned int idx = row * w + j;
++			lut_->sets[set].r_and_gr[idx].r = encode(0, i, j);
++			lut_->sets[set].r_and_gr[idx].gr = encode(1, i, j);
++			lut_->sets[set].gb_and_b[idx].gb = encode(2, i, j);
++			lut_->sets[set].gb_and_b[idx].b = encode(3, i, j);
++		}
++	}
++
++	LOG(IPU3Lsc, Debug) << "CT " << ct << " max gain " << maxGain
++			    << " gain_factor " << gainFactor_;
++}
++
++void Lsc::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		  [[maybe_unused]] IPAFrameContext &frameContext,
++		  ipu3_uapi_params *params)
++{
++	if (!configured_)
++		return;
++
++	unsigned int ct = static_cast<unsigned int>(context.activeState.awb.temperatureK);
++	ct = (ct + 50) / 100 * 100;
++	if (ct != lastCt_ || ct == 0) {
++		computeLut(ct);
++		lastCt_ = ct;
++	}
++
++	ipu3_uapi_shd_config &shd = params->acc_param.shd;
++	shd.shd.grid = grid_;
++	shd.shd.general = {};
++	shd.shd.general.shd_enable = 1;
++	shd.shd.general.gain_factor = gainFactor_;
++	shd.shd.black_level = {};
++	shd.shd_lut = *lut_;
++
++	params->use.acc_shd = 1;
++}
++
++REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
++
++} /* namespace ipa::ipu3::algorithms */
++
++} /* namespace libcamera */
+diff -ruN a/src/ipa/ipu3/algorithms/lsc.h b/src/ipa/ipu3/algorithms/lsc.h
+--- a/src/ipa/ipu3/algorithms/lsc.h	1970-01-01 09:00:00.000000000 +0900
++++ b/src/ipa/ipu3/algorithms/lsc.h	2026-11-19 16:49:18.068457318 +0900
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * IPU3 Lens Shading Correction from tuning data
++ */
++
++#pragma once
++
++#include <array>
++#include <map>
++#include <memory>
++#include <vector>
++
++#include <libcamera/geometry.h>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::ipu3::algorithms {
++
++class Lsc : public Algorithm
++{
++public:
++	Lsc() = default;
++
++	int init(IPAContext &context, const YamlObject &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     ipu3_uapi_params *params) override;
++
++private:
++	using Tables = std::array<std::vector<float>, 4>;
++
++	void computeLut(unsigned int ct);
++	float sample(const std::vector<float> &table, float u, float v) const;
++
++	/* Tuning data */
++	Size tuningSize_;
++	unsigned int tuningW_ = 0;
++	unsigned int tuningH_ = 0;
++	std::array<unsigned int, 4> channelMap_ = { 0, 1, 2, 3 };
++	std::map<unsigned int, Tables> sets_;
++	int testValue_ = -1;
++	int gainFactorOverride_ = -1;
++	int testChannel_ = -1;
++
++	/* Session geometry */
++	Size activeArea_;
++	Rectangle analogCrop_;
++	Size outputSize_;
++	Size ifSize_;
++	Size bdsSize_;
++	ipu3_uapi_shd_grid_config grid_ = {};
++	unsigned int gainFactor_ = 0;
++	bool configured_ = false;
++
++	std::unique_ptr<ipu3_uapi_shd_lut> lut_;
++	unsigned int lastCt_ = 0;
++};
++
++} /* namespace ipa::ipu3::algorithms */
++
++} /* namespace libcamera */
+diff -ruN a/src/ipa/ipu3/algorithms/meson.build b/src/ipa/ipu3/algorithms/meson.build
+--- a/src/ipa/ipu3/algorithms/meson.build	2026-11-19 16:49:18.061345470 +0900
++++ b/src/ipa/ipu3/algorithms/meson.build	2026-11-19 16:49:18.067124767 +0900
+@@ -5,5 +5,7 @@
+     'agc.cpp',
+     'awb.cpp',
+     'blc.cpp',
++    'ccm.cpp',
++    'lsc.cpp',
+     'tone_mapping.cpp',
+ ])

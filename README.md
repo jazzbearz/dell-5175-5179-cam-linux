@@ -7,6 +7,7 @@ Makes both built-in cameras of the **Dell Latitude 11 5179** 2-in-1 work on Linu
 | Front (user-facing, 5 MP) | OmniVision OV5670 | `INT3479` | ✅ streams via libcamera / PipeWire |
 | Rear (world-facing, 8 MP AF) | OmniVision OV8858 + DW9714 VCM | `INT3477` | ✅ streams, VCM probes |
 | Camera privacy LED | TPS68470 ILED A | — | ✅ on while either camera streams |
+| Lens shading / colour | Windows tuning via libcamera | — | ✅ optional (`userspace/tuning`) |
 
 Tested on Ubuntu 26.04, kernel `7.0.0-43-generic` (7.0.14 based), BIOS 1.7.2.
 The **Latitude 5175** uses the same Windows camera driver package and very
@@ -35,7 +36,7 @@ dkms/latitude5179-camera-1.4/   DKMS package (sources = Linux v7.0.14 + patches)
 patches/                        the same changes as patches against v7.0.14
 modprobe.d/                     selects ILED A as the privacy LED
 install.sh / uninstall.sh       convenience scripts (Ubuntu/Debian)
-userspace/                      optional libcamera patch + rebuild script (>720p in apps)
+userspace/                      optional libcamera patches (>720p, Ccm/Lsc), rebuild script, tuning tools
 PAPER.md                        research write-up
 ```
 
@@ -116,6 +117,43 @@ sudo apt install --allow-downgrades libcamera0.7=0.7.0-1ubuntu2 libcamera-ipa=0.
   libcamera-tools=0.7.0-1ubuntu2 libcamera-v4l2=0.7.0-1ubuntu2 gstreamer1.0-libcamera=0.7.0-1ubuntu2
 ```
 
+## Optional: lens-shading and colour correction from the Windows tuning
+
+Without tuning, libcamera's IPU3 pipeline does no lens-shading correction
+(corners at ~30–40 % of the centre brightness) and uses a generic colour
+matrix. `userspace/libcamera-0.7.0-ipu3-ccm-lsc.patch` adds two IPA
+algorithms, **Lsc** and **Ccm**, and `userspace/tuning/` converts Intel's
+per-module Windows tuning files (`*.cpf`, AIQB format, in Dell's `V9X4F`
+package) into libcamera tuning YAML.
+
+The generated tuning is derived from Dell/Intel data, so it is **not**
+distributed here. Generate it from your own download:
+
+```sh
+./userspace/build-libcamera.sh                  # libcamera with both patches (+ipu3vf2), held
+sudo ./userspace/tuning/find-modules.py         # module names from the BIOS, e.g.
+#   LNK0: module 4BA862T2  (rear)   LNK2: module 4BF523T2  (front)
+./userspace/tuning/install-tuning.sh ~/Downloads/Intel-2D-Imaging-Driver_V9X4F_WIN_30.14393.9656.3064_A03_02.EXE 4BF523T2 4BA862T2
+```
+
+`install-tuning.sh` writes `/etc/libcamera/ipa/ipu3/ov5670.yaml` and
+`ov8858.yaml`. Colour-matrix strength is `saturation:` in the `Ccm` section
+(default 0.3; 1.0 = Windows matrices, which amplify libcamera's simple AWB
+errors under mixed light).
+
+| Camera (this unit) | Corner/centre brightness, before → after |
+|---|---|
+| Front OV5670 (4BF523T2) | 0.43 → ≈1.0 |
+| Rear OV8858 (4BA862T2) | 0.31 → ≈0.6 |
+
+**Important:** delete the two YAML files before going back to a stock
+libcamera; stock libcamera does not know `Ccm`/`Lsc` and will refuse them.
+
+```sh
+sudo rm /etc/libcamera/ipa/ipu3/ov5670.yaml /etc/libcamera/ipa/ipu3/ov8858.yaml
+sudo apt-mark unhold libcamera0.7 libcamera-ipa libcamera-tools libcamera-v4l2 gstreamer1.0-libcamera
+```
+
 ## Uninstall
 
 ```sh
@@ -125,10 +163,9 @@ sudo apt install --allow-downgrades libcamera0.7=0.7.0-1ubuntu2 libcamera-ipa=0.
 ## Known issues
 
 - **Without the libcamera patch below, apps get at most 1280×720.**
-- **Image quality is below Windows.** libcamera's IPU3 IPA has no
-  sensor-specific tuning (lens shading, colour matrices) for OV5670/OV8858.
-  Windows' per-module Intel tuning files (`*.cpf`, AIQB format) cannot be used
-  by libcamera; see PAPER.md §10.
+- **Without the tuning section below, image quality is below Windows** (dark
+  corners, generic colours). Even with it, libcamera's grey-world AWB is
+  simpler than Intel's, so colours under mixed/night light can still drift.
 - `ov8858 ...: xvclk mismatched, modes are based on 24MHz` — the PMIC clock
   isn't 24 MHz. Images are fine; frame timing may differ from nominal.
 - libcamera logs `Unable to get rectangle ... on pad 0/0` for ov8858 (driver

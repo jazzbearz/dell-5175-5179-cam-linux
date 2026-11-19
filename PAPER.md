@@ -384,12 +384,84 @@ the module name that ACPI reports through `SSDB`/`_DSM` (GNVS fields
 neither reads AIQB nor has OV5670/OV8858 lens-shading or colour tuning, so
 images look softer and flatter than on Windows.
 
+### 9.3 Using the Windows tuning: lens shading and colour correction
+
+**Module identification.** The DSDT's GNVS field list gives the offsets of
+`L0M0…L0MF` / `L2M0…L2MF`. Reading GNVS (`0x87904000`) through `/dev/mem`
+returned `4BA862T2` (rear, LNK0, 4 lanes) and `4BF523T2` (front, LNK2,
+2 lanes), both with MCLK 19.2 MHz. That also explains the `ov8858` xvclk
+warning. Both names have matching `OV8858_4BA862T2_SKY.cpf` /
+`OV5670_4BF523T2_SKY.cpf` files in the Dell package.
+
+**AIQB layout.** A `.cpf` is a `CPFF` header followed by an `AIQB` block
+(size at +4). Records start at AIQB+0x18 as
+`[u32 size][u16 format][u16 id]`. The camera-module-characterisation ids
+used here:
+
+| id | Contents |
+|---|---|
+| 2 | sensor: width, height, bit depth, colour-order flag |
+| 3 | black level per (exposure, gain), ≈ 64 @ 10 bit |
+| 4 | 30 near-flat tables, 6 exposures × 5 gains (dark/black-level grid, *not* lens shading) |
+| 5 | saturation level (1023) |
+| 10 | **lens shading**: header `(1, n, w, h)`, then n × `[u16 light source, u16, u16, u16][4 × w·h u16]`, 4096 = 1.0 |
+| 15 | chromaticity per light source |
+| 18 | **colour matrices**: n × 84 B `[u16 light source][5 × u16][3×3 s15.16][copy]`, rows sum to 1 |
+
+Light-source ids follow the CIE illuminant order (1 = A 2856 K, 4 = D50,
+6 = D65, 7 = D75, 10 = F2, 12 = F4, 16 = F8, 19 = F11 …). Lens-shading
+corner gains are 3.3–5.1×. Grid sizes are 41×31 (front) and 51×39 (rear).
+
+**ImgU shading block, measured.** The uapi header doesn't fully specify the
+shading LUT, so it was characterised with a test pattern (left half of the
+grid set to v, right half 0) under auto exposure:
+
+1. The kernel sizes the shading operations by the **BDS output** height. The
+   grid therefore lives in BDS output coordinates: the downscaled IF crop,
+   which libcamera places at (0, 0) of the raw frame. A grid built for the
+   raw frame covered the whole picture and was cancelled by AGC.
+2. LUT entries are **u12**: 4096 behaves like 0 and 6144 like 2048. The left/right
+   ratio rose monotonically from 0.70 (v = 0) to 1.89 (v = 4095). Together with
+   the header's documented ranges, this gives
+   **gain = 1 + v · 2^gain_factor / 1024**.
+3. Setting one field at a time showed the four fields are **colour-labelled**:
+   `r` raises V, `b` raises U, and `gr`/`gb` are green.
+4. The AIQB channels are stored in the **sensor's raw Bayer order**. Front
+   (GRBG) needs AIQB→ImgU `r,gr,gb,b` = `[1,0,3,2]`. Rear (BGGR) needs
+   `[3,2,1,0]`. Other orders produced magenta/red/cyan corners on neutral
+   walls.
+
+**Implementation.** Two new IPU3 IPA algorithms
+(`userspace/libcamera-0.7.0-ipu3-ccm-lsc.patch`):
+
+- `Lsc` interpolates the tables by the AWB colour temperature. It maps each
+  ImgU grid point from BDS → IF → raw → sensor array (analogue crop and
+  binning) → tuning grid, then resamples bilinearly. It picks the finest grid
+  within the ImgU limits (≤ 146 cells per set, ≤ 28 sets) and the smallest
+  sufficient `gain_factor`.
+- `Ccm` interpolates the 3×3 matrices by colour temperature and writes s2.13
+  coefficients, after `Awb`, which otherwise writes a fixed default. An
+  optional `saturation` blends towards identity.
+
+The converter `cpf2yaml.py` emits libcamera tuning YAML. `install-tuning.sh`
+generates it from the user's own Dell download.
+
+**Results (this unit).** Corner/centre brightness went from 0.43 to ≈ 1.0
+(front) and from 0.31 to ≈ 0.6 (rear), with neutral corners. At full strength
+the colour matrices (diagonal ≈ 1.7–2.3) amplify the grey-world AWB error,
+giving pink centres and green edges under night/mixed light. The default
+strength is therefore 0.3. Streaming performance through PipeWire is
+unchanged (1080p ≈ 28 fps front, ≈ 22 fps rear).
+
 ## 10. Limitations and future work
 
-- **Image tuning.** Read this unit's module names from GNVS. Reverse-engineer
-  the CPFF/AIQB layout far enough to extract lens-shading grids and colour
-  matrices. Teach the IPU3 IPA to apply them, or convert them into libcamera
-  tuning YAML.
+- **AWB.** Intel's AWB uses per-module chromaticity data (record 15). Porting
+  that, or using libipa's Bayesian AWB with these priors, would let the colour
+  matrices run at full strength.
+- **Rear LSC strength** (≈ 0.6 corner/centre) may need checking on a true
+  flat field. The rear test scene was a window at night.
+- **Other AIQB records** (black-level tables, noise/sharpening, pipeCfg)
+  are not used yet.
 
 - **Latitude 5175** untested. It is covered by the same Windows package and
   is very likely identical, but needs a DMI match and confirmation of the
