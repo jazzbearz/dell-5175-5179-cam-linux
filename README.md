@@ -107,7 +107,7 @@ the `Types:` lines in `/etc/apt/sources.list.d/ubuntu.sources`, then:
 
 ```sh
 sudo apt-get update
-./userspace/build-libcamera.sh      # builds 0.7.0-1ubuntu2+ipu3vf1 and installs it
+./userspace/build-libcamera.sh      # builds 0.7.0-1ubuntu2+ipu3vf3 and installs it
 ```
 
 An Ubuntu libcamera update will replace the patched build. To revert by hand:
@@ -121,8 +121,10 @@ sudo apt install --allow-downgrades libcamera0.7=0.7.0-1ubuntu2 libcamera-ipa=0.
 
 Without tuning, libcamera's IPU3 pipeline does no lens-shading correction
 (corners at ~30–40 % of the centre brightness) and uses a generic colour
-matrix. `userspace/libcamera-0.7.0-ipu3-ccm-lsc.patch` adds two IPA
-algorithms, **Lsc** and **Ccm**, and `userspace/tuning/` converts Intel's
+matrix, a fixed black level and gamma 1.1.
+`userspace/libcamera-0.7.0-ipu3-ccm-lsc.patch` adds **Lsc** and **Ccm**
+algorithms and makes **Awb** (white locus), **BlackLevelCorrection** and
+**ToneMapping** (gamma) configurable. `userspace/tuning/` converts Intel's
 per-module Windows tuning files (`*.cpf`, AIQB format, in Dell's `V9X4F`
 package) into libcamera tuning YAML.
 
@@ -130,16 +132,28 @@ The generated tuning is derived from Dell/Intel data, so it is **not**
 distributed here. Generate it from your own download:
 
 ```sh
-./userspace/build-libcamera.sh                  # libcamera with both patches (+ipu3vf2), held
+./userspace/build-libcamera.sh                  # libcamera with both patches (+ipu3vf3), held
 sudo ./userspace/tuning/find-modules.py         # module names from the BIOS, e.g.
 #   LNK0: module 4BA862T2  (rear)   LNK2: module 4BF523T2  (front)
 ./userspace/tuning/install-tuning.sh ~/Downloads/Intel-2D-Imaging-Driver_V9X4F_WIN_30.14393.9656.3064_A03_02.EXE 4BF523T2 4BA862T2
 ```
 
 `install-tuning.sh` writes `/etc/libcamera/ipa/ipu3/ov5670.yaml` and
-`ov8858.yaml`. Colour-matrix strength is `saturation:` in the `Ccm` section
-(default 0.3; 1.0 = Windows matrices, which amplify libcamera's simple AWB
-errors under mixed light).
+`ov8858.yaml`:
+
+| | Front (OV5670) | Rear (OV8858) |
+|---|---|---|
+| Black level | 128 (from the tuning file) | 64 |
+| Gamma | 2.2 | 1.1 |
+| Colour matrix strength | 1.0 (Windows) | 0.3 |
+| Colour temperature | sensor white locus | libcamera grey-world |
+| Lens shading | Windows | Windows |
+
+The front uses the Windows values as they are. The rear module's Windows
+colour matrices are much stronger and, without Intel's noise reduction and
+AWB, give green edges and magenta shadows, so it keeps conservative values.
+Override with `REAR_SATURATION`, `REAR_GAMMA`, `REAR_BLACK_LEVEL`, or edit
+the YAML (`saturation:`, `gamma:`, `blackLevel:`) and restart wireplumber.
 
 | Camera (this unit) | Corner/centre brightness, before → after |
 |---|---|

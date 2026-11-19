@@ -405,7 +405,7 @@ used here:
 | 4 | 30 near-flat tables, 6 exposures × 5 gains (dark/black-level grid, *not* lens shading) |
 | 5 | saturation level (1023) |
 | 10 | **lens shading**: header `(1, n, w, h)`, then n × `[u16 light source, u16, u16, u16][4 × w·h u16]`, 4096 = 1.0 |
-| 15 | chromaticity per light source |
+| 15 | **white locus**: `u16 n`, pad, then n × `[u16 x, u16 y]` (CIE xy × 65536) `[u16 R/G, u16 B/G]` (sensor raw ratios × 1000) |
 | 18 | **colour matrices**: n × 84 B `[u16 light source][5 × u16][3×3 s15.16][copy]`, rows sum to 1 |
 
 Light-source ids follow the CIE illuminant order (1 = A 2856 K, 4 = D50,
@@ -442,16 +442,48 @@ grid set to v, right half 0) under auto exposure:
 - `Ccm` interpolates the 3×3 matrices by colour temperature and writes s2.13
   coefficients, after `Awb`, which otherwise writes a fixed default. An
   optional `saturation` blends towards identity.
+- `Awb` optionally reads the record-15 white locus. After grey-world, the
+  measured R/G, B/G is projected onto the locus polyline and the colour
+  temperature is read from the projection (CCT of each locus point by
+  McCamy's formula from its CIE xy). Grey-world alone estimated ≈ 7400 K
+  under ≈ 4000 K room light, which selected the wrong CCM/LSC set. Moving the
+  *gains* onto the locus as well (`constrainToLocus: true`) tinted scenes that
+  are not grey on average, so by default only the temperature is taken from
+  the locus.
+- `BlackLevelCorrection` reads `blackLevel` instead of the fixed 64. The
+  obgrid values are in units of **2 per 10-bit count** (measured: 64 left the
+  front image washed out, 256 crushed it). Record 3 gives 64.3 → 128.
+- `ToneMapping` reads `gamma` instead of libcamera's hard-coded 1.1. At 1.1
+  the stock CCMs make the image look dark and saturated; the Windows
+  pipeline's output is close to sRGB, so 2.2 is used with the stock data.
 
 The converter `cpf2yaml.py` emits libcamera tuning YAML. `install-tuning.sh`
 generates it from the user's own Dell download.
 
 **Results (this unit).** Corner/centre brightness went from 0.43 to ≈ 1.0
-(front) and from 0.31 to ≈ 0.6 (rear), with neutral corners. At full strength
-the colour matrices (diagonal ≈ 1.7–2.3) amplify the grey-world AWB error,
-giving pink centres and green edges under night/mixed light. The default
-strength is therefore 0.3. Streaming performance through PipeWire is
-unchanged (1080p ≈ 28 fps front, ≈ 22 fps rear).
+(front) and from 0.31 to ≈ 0.6 (rear), with neutral corners.
+
+The two cameras ended up with different settings:
+
+| | Front OV5670 | Rear OV8858 |
+|---|---|---|
+| Black level | 128 (record 3 × 2) | 64 |
+| Gamma | 2.2 | 1.1 |
+| CCM strength | 1.0 (stock) | 0.3 |
+| CCT from | white locus | grey-world |
+| Lens shading | stock | stock |
+
+With the full stock set the front matches Windows closely. Each step on the
+way was visibly wrong on its own: CCM without the right black level and gamma
+was red, then dark, then washed out. The rear's stock CCMs are much stronger
+(diagonal up to ≈ 2.3). With them at full strength and gamma 2.2 the rear
+showed a green edge and magenta shadows. Turning the CCM off removed the
+magenta, while turning lens shading off did not remove the green edge. So
+the cause is the strong matrix amplifying noise and the grey-world AWB error,
+not the shading data. Intel's AIQ has per-frame noise reduction and a
+better AWB that libcamera's IPU3 IPA lacks. The rear therefore keeps the
+conservative settings. Streaming performance through PipeWire is unchanged
+(1080p ≈ 28 fps front, ≈ 22 fps rear).
 
 ## 10. Limitations and future work
 

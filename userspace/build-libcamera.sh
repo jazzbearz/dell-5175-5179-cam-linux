@@ -8,7 +8,7 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 PATCHES="$HERE/libcamera-0.7.0-ipu3-advertise-full-vf-range.patch $HERE/libcamera-0.7.0-ipu3-ccm-lsc.patch"
 WORK=${WORK:-"$HOME/libcamera-ipu3-build"}
-SUFFIX=ipu3vf2
+SUFFIX=ipu3vf3
 
 ver=$(dpkg-query -W -f '${Version}' libcamera0.7 2>/dev/null || true)
 case "$ver" in

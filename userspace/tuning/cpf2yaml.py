@@ -6,11 +6,14 @@ container, AIQ v2.0) into a libcamera IPU3 tuning YAML containing:
 
   - Ccm: colour correction matrices per colour temperature (CMC record 18)
   - Lsc: lens-shading gain grids per colour temperature (CMC record 10)
+  - Awb: sensor white locus for the colour temperature (CMC record 15)
+  - BlackLevelCorrection: black level (CMC record 3)
+  - ToneMapping: output gamma
 
 The layout was reverse-engineered from Dell's V9X4F package (OV5670/OV8858,
 Skylake). See PAPER.md. Only the records needed here are decoded.
 
-Usage: cpf2yaml.py INPUT.cpf OUTPUT.yaml [--sensor NAME]
+Usage: cpf2yaml.py INPUT.cpf OUTPUT.yaml --bayer ORDER [options]
 """
 
 import argparse
@@ -86,6 +89,29 @@ def parse_sensor(data, recs):
     return w, h, bits, order
 
 
+def mccamy_cct(x, y):
+    n = (x - 0.3320) / (0.1858 - y)
+    return 449 * n ** 3 + 3525 * n ** 2 + 6823.3 * n + 5520.33
+
+
+def parse_locus(data, recs):
+    """CMC record 15: n x (CIE x, y as u16/65536; sensor R/G, B/G x1000)."""
+    off, size, _ = recs[15]
+    n = struct.unpack_from('<H', data, off)[0]
+    out = []
+    for i in range(n):
+        x, y, rg, bg = struct.unpack_from('<4H', data, off + 4 + 8 * i)
+        out.append((round(mccamy_cct(x / 65536, y / 65536)), rg / 1000, bg / 1000))
+    return sorted(out)
+
+
+def parse_black_level(data, recs):
+    """CMC record 3: first entry is the lowest gain; 4 channels, u8.8 @ sensor bits."""
+    off, _, _ = recs[3]
+    vals = struct.unpack_from('<4H', data, off + 12)
+    return sum(vals) / 4 / 256
+
+
 def parse_ccm(data, recs):
     off, size, _ = recs[18]
     n = struct.unpack_from('<H', data, off)[0]
@@ -145,8 +171,16 @@ def main():
     ap.add_argument('--bayer', required=True, choices=sorted(BAYER_MAPS),
                     help='raw Bayer order of the sensor as seen by Linux '
                          '(ImgU input format; e.g. OV5670 GRBG, OV8858 BGGR)')
-    ap.add_argument('--saturation', type=float, default=0.6,
-                    help='CCM strength, 0 = identity, 1 = tuned matrices (default 0.6)')
+    ap.add_argument('--saturation', type=float, default=1.0,
+                    help='CCM strength, 0 = identity, 1 = tuned matrices (default 1.0)')
+    ap.add_argument('--gamma', type=float, default=2.2,
+                    help='output gamma for ToneMapping (default 2.2, sRGB-like)')
+    ap.add_argument('--bl-scale', type=float, default=2.0,
+                    help='ImgU obgrid units per 10-bit black-level count (measured: 2)')
+    ap.add_argument('--black-level', type=int, default=None,
+                    help='override the ImgU black level (default: CMC record 3 x bl-scale)')
+    ap.add_argument('--no-locus', action='store_true',
+                    help="don't emit the white locus (use libcamera's CCT estimate)")
     args = ap.parse_args()
 
     data = open(args.input, 'rb').read()
@@ -155,6 +189,8 @@ def main():
     ccms = unique_by_cct(parse_ccm(data, recs))
     (gw, gh), lsc = parse_lsc(data, recs)
     lsc = unique_by_cct(lsc)
+    locus = parse_locus(data, recs)
+    black = parse_black_level(data, recs)
 
     o = []
     o.append('# SPDX-License-Identifier: CC0-1.0')
@@ -167,7 +203,20 @@ def main():
     o.append('  - Af:')
     o.append('  - Agc:')
     o.append('  - Awb:')
+    if args.no_locus:
+        locus = []
+    if locus:
+        o.append('      # sensor white locus (CMC record 15): ct, raw R/G, B/G. Used for the')
+        o.append('      # colour temperature; gains stay grey-world (projecting them onto the')
+        o.append('      # locus tints non-grey scenes).')
+        o.append('      constrainToLocus: false')
+        o.append('      locus:')
+        for ct, rg, bg in locus:
+            o.append(f'        - {{ ct: {ct}, rg: {rg:.3f}, bg: {bg:.3f} }}')
     o.append('  - BlackLevelCorrection:')
+    o.append(f'      # {black:.2f} @ {bits} bit (CMC record 3)')
+    bl = args.black_level if args.black_level is not None else round(black * args.bl_scale)
+    o.append(f'      blackLevel: {bl}')
     o.append('  - Ccm:')
     o.append(f'      saturation: {args.saturation}')
     o.append('      ccms:')
@@ -188,6 +237,7 @@ def main():
         for c in range(4):
             o.append(f'          c{c}: ' + fmt_list(chans[c], per_line=gw if gw <= 64 else 32, indent=12))
     o.append('  - ToneMapping:')
+    o.append(f'      gamma: {args.gamma}')
     o.append('...')
 
     with open(args.output, 'w') as f:

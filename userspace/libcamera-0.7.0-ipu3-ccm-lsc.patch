@@ -1,6 +1,203 @@
+diff -ruN a/src/ipa/ipu3/algorithms/awb.cpp b/src/ipa/ipu3/algorithms/awb.cpp
+--- a/src/ipa/ipu3/algorithms/awb.cpp	2026-11-19 20:35:12.205247027 +0900
++++ b/src/ipa/ipu3/algorithms/awb.cpp	2026-11-19 20:35:12.209536013 +0900
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <limits>
+ 
+ #include <libcamera/base/log.h>
+ 
+@@ -15,6 +16,8 @@
+ 
+ #include "libipa/colours.h"
+ 
++#include "libcamera/internal/yaml_parser.h"
++
+ /**
+  * \file awb.h
+  */
+@@ -198,6 +201,73 @@
+ Awb::~Awb() = default;
+ 
+ /**
++ * \brief Load the optional sensor white locus from tuning data
++ *
++ * The locus lists, for reference illuminants, the colour temperature and the
++ * raw sensor R/G and B/G ratios of a white surface (Intel CMC record 15).
++ * When present, the grey-world estimate is projected onto it: the colour
++ * temperature is read from the locus and, if constrainToLocus is set, the
++ * gains are taken from the projected point, which removes green/magenta
++ * casts.
++ */
++int Awb::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	locus_.clear();
++	for (const auto &p : tuningData["locus"].asList()) {
++		auto ct = p["ct"].get<double>();
++		auto rg = p["rg"].get<double>();
++		auto bg = p["bg"].get<double>();
++		if (!ct || !rg || !bg)
++			return -EINVAL;
++		locus_.push_back({ *ct, *rg, *bg });
++	}
++	std::sort(locus_.begin(), locus_.end(),
++		  [](const LocusPoint &a, const LocusPoint &b) { return a.ct < b.ct; });
++	constrainToLocus_ = tuningData["constrainToLocus"].get<bool>(true);
++
++	if (!locus_.empty())
++		LOG(IPU3Awb, Info) << "Using sensor white locus with "
++				   << locus_.size() << " points";
++	return 0;
++}
++
++void Awb::applyLocus(double &redGain, double &blueGain)
++{
++	if (locus_.size() < 2)
++		return;
++
++	double rg = 1.0 / std::max(redGain, 1e-3);
++	double bg = 1.0 / std::max(blueGain, 1e-3);
++
++	double bestDist = std::numeric_limits<double>::max();
++	double bestCt = locus_.front().ct, bestRg = rg, bestBg = bg;
++	for (size_t i = 0; i + 1 < locus_.size(); i++) {
++		const LocusPoint &a = locus_[i], &b = locus_[i + 1];
++		double dx = b.rg - a.rg, dy = b.bg - a.bg;
++		double len2 = dx * dx + dy * dy;
++		double t = len2 > 0 ? ((rg - a.rg) * dx + (bg - a.bg) * dy) / len2 : 0;
++		t = std::clamp(t, 0.0, 1.0);
++		double px = a.rg + t * dx, py = a.bg + t * dy;
++		double d = (rg - px) * (rg - px) + (bg - py) * (bg - py);
++		if (d < bestDist) {
++			bestDist = d;
++			bestCt = a.ct + t * (b.ct - a.ct);
++			bestRg = px;
++			bestBg = py;
++		}
++	}
++
++	LOG(IPU3Awb, Debug) << "Locus: measured R/G " << rg << " B/G " << bg
++			    << " -> " << bestRg << "/" << bestBg << " CT " << bestCt;
++
++	asyncResults_.temperatureK = bestCt;
++	if (constrainToLocus_) {
++		redGain = 1.0 / bestRg;
++		blueGain = 1.0 / bestBg;
++	}
++}
++
++/**
+  * \copydoc libcamera::ipa::Algorithm::configure
+  */
+ int Awb::configure(IPAContext &context,
+@@ -413,6 +483,7 @@
+ 
+ 	/* Color temperature is not relevant in Grey world but still useful to estimate it :-) */
+ 	asyncResults_.temperatureK = estimateCCT({{ sumRed.r(), sumRed.g(), sumBlue.b() }});
++	applyLocus(redGain, blueGain);
+ 
+ 	/*
+ 	 * Gain values are unsigned integer value ranging [0, 8) with 13 bit
+diff -ruN a/src/ipa/ipu3/algorithms/awb.h b/src/ipa/ipu3/algorithms/awb.h
+--- a/src/ipa/ipu3/algorithms/awb.h	2026-11-19 20:35:12.205512780 +0900
++++ b/src/ipa/ipu3/algorithms/awb.h	2026-11-19 20:35:12.209594867 +0900
+@@ -40,6 +40,7 @@
+ 	Awb();
+ 	~Awb();
+ 
++	int init(IPAContext &context, const YamlObject &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+@@ -63,6 +64,7 @@
+ 	void generateAwbStats(const ipu3_uapi_stats_3a *stats);
+ 	void clearAwbStats();
+ 	void awbGreyWorld();
++	void applyLocus(double &redGain, double &blueGain);
+ 	static constexpr uint16_t threshold(float value);
+ 	static constexpr uint16_t gainValue(double gain);
+ 
+@@ -70,6 +72,15 @@
+ 	Accumulator awbStats_[kAwbStatsSizeX * kAwbStatsSizeY];
+ 	AwbStatus asyncResults_;
+ 
++	/* Sensor white locus from tuning: colour temperature, raw R/G, B/G. */
++	struct LocusPoint {
++		double ct;
++		double rg;
++		double bg;
++	};
++	std::vector<LocusPoint> locus_;
++	bool constrainToLocus_ = true;
++
+ 	uint32_t stride_;
+ 	uint32_t cellsPerZoneX_;
+ 	uint32_t cellsPerZoneY_;
+diff -ruN a/src/ipa/ipu3/algorithms/blc.cpp b/src/ipa/ipu3/algorithms/blc.cpp
+--- a/src/ipa/ipu3/algorithms/blc.cpp	2026-11-19 20:35:12.205772857 +0900
++++ b/src/ipa/ipu3/algorithms/blc.cpp	2026-11-19 20:35:12.209644028 +0900
+@@ -7,6 +7,8 @@
+ 
+ #include "blc.h"
+ 
++#include "libcamera/internal/yaml_parser.h"
++
+ /**
+  * \file blc.h
+  * \brief IPU3 Black Level Correction control
+@@ -34,6 +36,14 @@
+ {
+ }
+ 
++int BlackLevelCorrection::init([[maybe_unused]] IPAContext &context,
++			       const YamlObject &tuningData)
++{
++	/* Optional sensor black level in ImgU obgrid units (default 64). */
++	blackLevel_ = tuningData["blackLevel"].get<uint16_t>(64);
++	return 0;
++}
++
+ /**
+  * \brief Fill in the parameter structure, and enable black level correction
+  * \param[in] context The shared IPA context
+@@ -54,10 +64,10 @@
+ 	 * \todo The correction values should come from sensor specific
+ 	 * tuning processes. This is a first rough approximation.
+ 	 */
+-	params->obgrid_param.gr = 64;
+-	params->obgrid_param.r = 64;
+-	params->obgrid_param.b = 64;
+-	params->obgrid_param.gb = 64;
++	params->obgrid_param.gr = blackLevel_;
++	params->obgrid_param.r = blackLevel_;
++	params->obgrid_param.b = blackLevel_;
++	params->obgrid_param.gb = blackLevel_;
+ 
+ 	/* Enable the custom black level correction processing */
+ 	params->use.obgrid = 1;
+diff -ruN a/src/ipa/ipu3/algorithms/blc.h b/src/ipa/ipu3/algorithms/blc.h
+--- a/src/ipa/ipu3/algorithms/blc.h	2026-11-19 20:35:12.206054977 +0900
++++ b/src/ipa/ipu3/algorithms/blc.h	2026-11-19 20:35:12.209693490 +0900
+@@ -18,9 +18,14 @@
+ public:
+ 	BlackLevelCorrection();
+ 
++	int init(IPAContext &context, const YamlObject &tuningData) override;
++
+ 	void prepare(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     ipu3_uapi_params *params) override;
++
++private:
++	uint16_t blackLevel_ = 64;
+ };
+ 
+ } /* namespace ipa::ipu3::algorithms */
 diff -ruN a/src/ipa/ipu3/algorithms/ccm.cpp b/src/ipa/ipu3/algorithms/ccm.cpp
 --- a/src/ipa/ipu3/algorithms/ccm.cpp	1970-01-01 09:00:00.000000000 +0900
-+++ b/src/ipa/ipu3/algorithms/ccm.cpp	2026-11-19 16:49:18.068349892 +0900
++++ b/src/ipa/ipu3/algorithms/ccm.cpp	2026-11-19 20:35:12.210347694 +0900
 @@ -0,0 +1,98 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
@@ -102,7 +299,7 @@ diff -ruN a/src/ipa/ipu3/algorithms/ccm.cpp b/src/ipa/ipu3/algorithms/ccm.cpp
 +} /* namespace libcamera */
 diff -ruN a/src/ipa/ipu3/algorithms/ccm.h b/src/ipa/ipu3/algorithms/ccm.h
 --- a/src/ipa/ipu3/algorithms/ccm.h	1970-01-01 09:00:00.000000000 +0900
-+++ b/src/ipa/ipu3/algorithms/ccm.h	2026-11-19 16:49:18.068195137 +0900
++++ b/src/ipa/ipu3/algorithms/ccm.h	2026-11-19 20:35:12.210293993 +0900
 @@ -0,0 +1,36 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
@@ -142,8 +339,8 @@ diff -ruN a/src/ipa/ipu3/algorithms/ccm.h b/src/ipa/ipu3/algorithms/ccm.h
 +} /* namespace libcamera */
 diff -ruN a/src/ipa/ipu3/algorithms/lsc.cpp b/src/ipa/ipu3/algorithms/lsc.cpp
 --- a/src/ipa/ipu3/algorithms/lsc.cpp	1970-01-01 09:00:00.000000000 +0900
-+++ b/src/ipa/ipu3/algorithms/lsc.cpp	2026-11-19 16:49:18.068564501 +0900
-@@ -0,0 +1,291 @@
++++ b/src/ipa/ipu3/algorithms/lsc.cpp	2026-11-19 20:35:12.210459758 +0900
+@@ -0,0 +1,305 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * IPU3 Lens Shading Correction from tuning data
@@ -207,6 +404,16 @@ diff -ruN a/src/ipa/ipu3/algorithms/lsc.cpp b/src/ipa/ipu3/algorithms/lsc.cpp
 +	testValue_ = tuningData["testPattern"].get<int>(-1);
 +	gainFactorOverride_ = tuningData["gainFactor"].get<int>(-1);
 +	testChannel_ = tuningData["testChannel"].get<int>(-1);
++
++	/*
++	 * The tuning may be characterised with the sensor read out mirrored
++	 * and/or flipped relative to the Linux driver: flip: [ h, v ].
++	 */
++	auto flip = tuningData["flip"].getList<unsigned int>();
++	if (flip && flip->size() == 2) {
++		hflip_ = (*flip)[0];
++		vflip_ = (*flip)[1];
++	}
 +
 +	const unsigned int cells = tuningW_ * tuningH_;
 +	for (const auto &set : tuningData["sets"].asList()) {
@@ -350,9 +557,13 @@ diff -ruN a/src/ipa/ipu3/algorithms/lsc.cpp b/src/ipa/ipu3/algorithms/lsc.cpp
 +		for (unsigned int i = 0; i < h; i++) {
 +			float py = std::min<float>(i << grid_.block_height_log2, bdsSize_.height - 1) * by;
 +			float v = (analogCrop_.y + py * sy + offY) * kv;
++			if (vflip_)
++				v = (tuningH_ - 1) - v;
 +			for (unsigned int j = 0; j < w; j++) {
 +				float px = std::min<float>(j << grid_.block_width_log2, bdsSize_.width - 1) * bx;
 +				float u = (analogCrop_.x + px * sx + offX) * ku;
++				if (hflip_)
++					u = (tuningW_ - 1) - u;
 +				for (unsigned int c = 0; c < 4; c++) {
 +					unsigned int src = channelMap_[c];
 +					float g = sample(a->at(src), u, v) * (1 - lambda) +
@@ -437,8 +648,8 @@ diff -ruN a/src/ipa/ipu3/algorithms/lsc.cpp b/src/ipa/ipu3/algorithms/lsc.cpp
 +} /* namespace libcamera */
 diff -ruN a/src/ipa/ipu3/algorithms/lsc.h b/src/ipa/ipu3/algorithms/lsc.h
 --- a/src/ipa/ipu3/algorithms/lsc.h	1970-01-01 09:00:00.000000000 +0900
-+++ b/src/ipa/ipu3/algorithms/lsc.h	2026-11-19 16:49:18.068457318 +0900
-@@ -0,0 +1,64 @@
++++ b/src/ipa/ipu3/algorithms/lsc.h	2026-11-19 20:35:12.210403802 +0900
+@@ -0,0 +1,66 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * IPU3 Lens Shading Correction from tuning data
@@ -485,6 +696,8 @@ diff -ruN a/src/ipa/ipu3/algorithms/lsc.h b/src/ipa/ipu3/algorithms/lsc.h
 +	int testValue_ = -1;
 +	int gainFactorOverride_ = -1;
 +	int testChannel_ = -1;
++	bool hflip_ = false;
++	bool vflip_ = false;
 +
 +	/* Session geometry */
 +	Size activeArea_;
@@ -504,8 +717,8 @@ diff -ruN a/src/ipa/ipu3/algorithms/lsc.h b/src/ipa/ipu3/algorithms/lsc.h
 +
 +} /* namespace libcamera */
 diff -ruN a/src/ipa/ipu3/algorithms/meson.build b/src/ipa/ipu3/algorithms/meson.build
---- a/src/ipa/ipu3/algorithms/meson.build	2026-11-19 16:49:18.061345470 +0900
-+++ b/src/ipa/ipu3/algorithms/meson.build	2026-11-19 16:49:18.067124767 +0900
+--- a/src/ipa/ipu3/algorithms/meson.build	2026-11-19 20:35:12.206271382 +0900
++++ b/src/ipa/ipu3/algorithms/meson.build	2026-11-19 20:35:12.210018978 +0900
 @@ -5,5 +5,7 @@
      'agc.cpp',
      'awb.cpp',
@@ -514,3 +727,54 @@ diff -ruN a/src/ipa/ipu3/algorithms/meson.build b/src/ipa/ipu3/algorithms/meson.
 +    'lsc.cpp',
      'tone_mapping.cpp',
  ])
+diff -ruN a/src/ipa/ipu3/algorithms/tone_mapping.cpp b/src/ipa/ipu3/algorithms/tone_mapping.cpp
+--- a/src/ipa/ipu3/algorithms/tone_mapping.cpp	2026-11-19 20:35:12.206548143 +0900
++++ b/src/ipa/ipu3/algorithms/tone_mapping.cpp	2026-11-19 20:35:12.210122006 +0900
+@@ -7,6 +7,8 @@
+ 
+ #include "tone_mapping.h"
+ 
++#include "libcamera/internal/yaml_parser.h"
++
+ #include <cmath>
+ #include <string.h>
+ 
+@@ -32,6 +34,18 @@
+ }
+ 
+ /**
++ * \brief Read the output gamma from tuning data
++ *
++ * libcamera historically uses 1.1 (nearly linear). Tuned sensors may set
++ * e.g. 2.2 for an sRGB-like output curve.
++ */
++int ToneMapping::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	gamma_ = tuningData["gamma"].get<double>(1.1);
++	return 0;
++}
++
++/**
+  * \brief Configure the tone mapping given a configInfo
+  * \param[in] context The shared IPA context
+  * \param[in] configInfo The IPA configuration data
+@@ -94,7 +108,7 @@
+ 	 *
+ 	 * \todo Expose gamma control setting through the libcamera control API
+ 	 */
+-	gamma_ = 1.1;
++	/* gamma_ is set from tuning data in init() (default 1.1). */
+ 
+ 	if (context.activeState.toneMapping.gamma == gamma_)
+ 		return;
+diff -ruN a/src/ipa/ipu3/algorithms/tone_mapping.h b/src/ipa/ipu3/algorithms/tone_mapping.h
+--- a/src/ipa/ipu3/algorithms/tone_mapping.h	2026-11-19 20:35:12.206801853 +0900
++++ b/src/ipa/ipu3/algorithms/tone_mapping.h	2026-11-19 20:35:12.210208400 +0900
+@@ -18,6 +18,7 @@
+ public:
+ 	ToneMapping();
+ 
++	int init(IPAContext &context, const YamlObject &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext, ipu3_uapi_params *params) override;
