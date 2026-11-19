@@ -348,15 +348,48 @@ actual frame rate differs from nominal, but images are correct. libcamera
 also reports `Unable to get rectangle` for `ov8858`, because the driver lacks
 crop-selection support.
 
+### 9.1 Userspace: the 720p ceiling
+
+With the kernel side working, applications still received at most 1280×720,
+even though the sensors stream 3200×2432 (rear) and 2560×1920 (front) in
+libcamera's StillCapture role. The xvclk mismatch was not the cause. The
+chain is:
+
+1. PipeWire's libcamera plugin (`spa/plugins/libcamera/libcamera-source.cpp`,
+   1.6.2) generates a configuration for `StreamRole::VideoRecording` and
+   offers applications the sizes in that role's `StreamFormats`.
+2. libcamera's IPU3 pipeline handler (`ipu3.cpp`, v0.7.0) uses
+   `kViewfinderSize` (1280×720) both as the *default* size for
+   Viewfinder/VideoRecording and as the *maximum* of the advertised
+   `SizeRange`.
+3. `validate()` accepts larger viewfinder sizes regardless:
+   `cam -s role=viewfinder,width=2560,height=1920` streamed at 30 fps.
+
+The patch in `userspace/` keeps 1280×720 as the default but advertises the
+StillCapture maximum. With a rebuilt Ubuntu package (`0.7.0-1ubuntu2+ipu3vf1`),
+PipeWire offers up to 3200×2400 (rear) and 2560×1600 (front). Streams
+through `pipewiresrc` ran at 1920×1080 ≈ 28 fps (front), and at 1920×1080 and
+3200×2400 ≈ 22 fps (rear). This change is a candidate for libcamera upstream.
+
+### 9.2 Tuning data
+
+Windows image quality comes largely from per-module tuning. The Dell package
+contains Intel IQ Studio tuning files for 11 OV5670 and 15 OV8858 module
+variants (`OV5670_<module>_SKY.cpf`, `OV8858_<module>_SKY.cpf`, each with a
+`*_pipeCfg.bin`, plus `defaultCpff.aiqb`). Each `.cpf` is a `CPFF` container
+wrapping an `AIQB` blob (AIQ v2.0, IQ Studio 0.10.4, 2015), consumed by the
+closed `libia_cp`/`IntelCameraPlugin` stack. Windows selects the file from
+the module name that ACPI reports through `SSDB`/`_DSM` (GNVS fields
+`L0M0…L0MF`, `L2M0…L2MF`). libcamera's IPU3 IPA (AGC, AWB, tone mapping, AF)
+neither reads AIQB nor has OV5670/OV8858 lens-shading or colour tuning, so
+images look softer and flatter than on Windows.
+
 ## 10. Limitations and future work
 
-- **Resolution and image quality in applications.** libcamera's IPU3
-  pipeline limits the viewfinder role to 1280×720, and PipeWire-based
-  applications use that role, so video calls and Snapshot get 720p even though
-  the sensors deliver 8 MP / 5 MP in the still role. In addition, the IPU3 IPA
-  has no OV5670/OV8858 tuning (lens shading, colour matrices), so images look
-  softer and flatter than with Intel's tuned Windows ISP. Both are userspace
-  work items.
+- **Image tuning.** Read this unit's module names from GNVS. Reverse-engineer
+  the CPFF/AIQB layout far enough to extract lens-shading grids and colour
+  matrices. Teach the IPU3 IPA to apply them, or convert them into libcamera
+  tuning YAML.
 
 - **Latitude 5175** untested. It is covered by the same Windows package and
   is very likely identical, but needs a DMI match and confirmation of the

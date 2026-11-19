@@ -35,6 +35,7 @@ dkms/latitude5179-camera-1.4/   DKMS package (sources = Linux v7.0.14 + patches)
 patches/                        the same changes as patches against v7.0.14
 modprobe.d/                     selects ILED A as the privacy LED
 install.sh / uninstall.sh       convenience scripts (Ubuntu/Debian)
+userspace/                      optional libcamera patch + rebuild script (>720p in apps)
 PAPER.md                        research write-up
 ```
 
@@ -86,6 +87,35 @@ Use a PipeWire/libcamera app: **GNOME Snapshot** (`sudo apt install gnome-snapsh
 Firefox/Chromium (WebRTC), OBS (PipeWire camera source). Cheese does not work
 with IPU3 cameras.
 
+## Optional: resolutions above 720p in apps (libcamera patch)
+
+libcamera's IPU3 pipeline advertises the Viewfinder/VideoRecording roles only
+up to 1280×720, and PipeWire builds its format list from that role, so
+Snapshot, browsers and video calls never see a larger size. The ImgU can
+actually stream larger viewfinder output, so
+[`userspace/libcamera-0.7.0-ipu3-advertise-full-vf-range.patch`](userspace/libcamera-0.7.0-ipu3-advertise-full-vf-range.patch)
+keeps 720p as the default but advertises the full range.
+
+| Camera | Max offered to apps (before → after) | Measured via PipeWire |
+|---|---|---|
+| Rear | 1280×720 → 3200×2400 | 1920×1080 and 3200×2400 ≈ 22 fps |
+| Front | 1280×720 → 2560×1600 | 1920×1080 ≈ 28 fps |
+
+To rebuild Ubuntu's libcamera package with the patch, first add `deb-src` to
+the `Types:` lines in `/etc/apt/sources.list.d/ubuntu.sources`, then:
+
+```sh
+sudo apt-get update
+./userspace/build-libcamera.sh      # builds 0.7.0-1ubuntu2+ipu3vf1 and installs it
+```
+
+An Ubuntu libcamera update will replace the patched build. To revert by hand:
+
+```sh
+sudo apt install --allow-downgrades libcamera0.7=0.7.0-1ubuntu2 libcamera-ipa=0.7.0-1ubuntu2 \
+  libcamera-tools=0.7.0-1ubuntu2 libcamera-v4l2=0.7.0-1ubuntu2 gstreamer1.0-libcamera=0.7.0-1ubuntu2
+```
+
 ## Uninstall
 
 ```sh
@@ -94,13 +124,11 @@ with IPU3 cameras.
 
 ## Known issues
 
-- **Apps get at most 1280×720.** The sensors run at full resolution
-  (`cam -c 1 -s role=still,width=3200,height=2432` ≈ 24 fps, front
-  `2560x1920` ≈ 30 fps), but libcamera's IPU3 pipeline caps the *viewfinder*
-  role at 1280×720, and PipeWire/browsers/Snapshot use that role. Image
-  quality is also below Windows: libcamera's IPU3 IPA has no sensor-specific
-  tuning (lens shading, colour) for OV5670/OV8858. Both are userspace
-  (libcamera/PipeWire) limitations, not kernel ones.
+- **Without the libcamera patch below, apps get at most 1280×720.**
+- **Image quality is below Windows.** libcamera's IPU3 IPA has no
+  sensor-specific tuning (lens shading, colour matrices) for OV5670/OV8858.
+  Windows' per-module Intel tuning files (`*.cpf`, AIQB format) cannot be used
+  by libcamera; see PAPER.md §10.
 - `ov8858 ...: xvclk mismatched, modes are based on 24MHz` — the PMIC clock
   isn't 24 MHz. Images are fine; frame timing may differ from nominal.
 - libcamera logs `Unable to get rectangle ... on pad 0/0` for ov8858 (driver

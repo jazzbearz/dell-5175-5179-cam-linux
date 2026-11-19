@@ -1,0 +1,23 @@
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp
+@@ -453,7 +453,19 @@
+ 							      ImgUDevice::kOutputAlignHeight);
+ 			pixelFormat = formats::NV12;
+ 			bufferCount = IPU3CameraConfiguration::kBufferCount;
+-			streamFormats[pixelFormat] = { { ImgUDevice::kOutputMinSize, size } };
++
++			/*
++			 * Keep 1280x720 as the default, but advertise the same
++			 * maximum as StillCapture: the ImgU can output larger
++			 * viewfinder/video streams, and applications (e.g.
++			 * PipeWire) only offer sizes within this range.
++			 */
++			Size maxSize = sensorResolution.boundedTo(ImgUDevice::kOutputMaxSize)
++						       .shrunkBy({ 1, 1 })
++						       .alignedDownTo(ImgUDevice::kOutputMarginWidth,
++								      ImgUDevice::kOutputMarginHeight);
++			streamFormats[pixelFormat] = { { ImgUDevice::kOutputMinSize,
++							 std::max(size, maxSize) } };
+ 
+ 			break;
+ 		}
